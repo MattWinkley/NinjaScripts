@@ -1,5 +1,4 @@
 # NinjaScripts
-I create NinjaScripts for fun and backtest parameters to find patterns that work for trading Futures. I specialize in NQ 1-minute, but they can be backtested on any instrument.
 
 A collection of custom trading strategies built for NinjaTrader 8 using NinjaScript (C#). These scripts are designed to automate entries, exits, and risk management for futures trading, with a focus on compliance with prop firm evaluation rules (Apex, TopStep, etc.).
 
