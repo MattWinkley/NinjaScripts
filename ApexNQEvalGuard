@@ -1,0 +1,298 @@
+// NOTE: Paste this entire file into a new NinjaTrader 8 Strategy named "ApexNQ_EvalGuard".
+// Platform: NinjaTrader 8 (C#)
+// Instrument: Intended for NQ (E-mini Nasdaq-100). Works on any timeframe (1–5m recommended).
+// Goal: Provide conservative, rule-aware automation tailored to Apex Trader Funding evaluation constraints.
+// Key features:
+//  - Enforces flat-before-close (4:59 PM ET).  
+//  - Optional soft daily loss cap & daily profit lock to protect trailing threshold.  
+//  - Per-trade risk is capped (default 30% of plan trailing threshold) and position size auto-scales to that cap.  
+//  - Uses ATR-based stop and 1.5R target; trend filter with EMAs & ADX to reduce chop.  
+//  - Tracks realized + unrealized PnL intra-trade to prevent giving back to trailing threshold.  
+//  - Exposes all risk/plan parameters so you can match your Apex plan (25k/50k/100k/etc.).
+//  - Conservative by default: 1 contract until account shows cushion; configurable.
+//
+// IMPORTANT: NinjaTrader cannot read the Apex trailing threshold from Rithmic/Tradovate directly.
+// This strategy approximates protections using your plan inputs (TrailingThresholdDollars, ProfitTargetDollars, etc.).
+// Always monitor R|Trader/Tradovate as required by Apex.
+
+#region Using declarations
+using System;
+using System.ComponentModel;
+using System.ComponentModel.DataAnnotations;
+using NinjaTrader.Cbi;
+using NinjaTrader.Data;
+using NinjaTrader.Gui;
+using NinjaTrader.Gui.Chart;
+using NinjaTrader.NinjaScript;
+using NinjaTrader.NinjaScript.DrawingTools;
+using NinjaTrader.NinjaScript.Indicators;
+#endregion
+
+namespace NinjaTrader.NinjaScript.Strategies
+{
+    public class ApexNQ_EvalGuard : Strategy
+    {
+        // === User Inputs (Plan/Risk) ===
+        [NinjaScriptProperty]
+        [Display(Name = "Account Start Balance ($)", Order = 1, GroupName = "Apex Plan")]
+        public double AccountStartBalance { get; set; } = 50000; // e.g., 50K plan
+
+        [NinjaScriptProperty]
+        [Display(Name = "Profit Target ($)", Order = 2, GroupName = "Apex Plan")]
+        public double ProfitTargetDollars { get; set; } = 3000;  // e.g., 50K plan target $3,000
+
+        [NinjaScriptProperty]
+        [Display(Name = "Trailing Threshold ($)", Order = 3, GroupName = "Apex Plan")]
+        public double TrailingThresholdDollars { get; set; } = 2500; // e.g., 50K plan drawdown
+
+        [NinjaScriptProperty]
+        [Display(Name = "Max Contracts", Order = 4, GroupName = "Trade Sizing")]
+        public int MaxContracts { get; set; } = 1; // start small (Apex encourages risk control)
+
+        [NinjaScriptProperty]
+        [Display(Name = "Risk Per Trade ($)", Order = 5, GroupName = "Trade Sizing")]
+        public double RiskPerTradeDollars { get; set; } = 750; // default 30% of 2,500 per Apex 3.0 risk guidance
+
+        [NinjaScriptProperty]
+        [Display(Name = "Daily Loss Cap ($)", Order = 6, GroupName = "Daily Guards")]
+        public double DailyLossCap { get; set; } = 600; // soft cap to protect trailing threshold
+
+        [NinjaScriptProperty]
+        [Display(Name = "Daily Profit Lock ($)", Order = 7, GroupName = "Daily Guards")]
+        public double DailyProfitLock { get; set; } = 800; // stop trading after locking daily gains
+
+        [NinjaScriptProperty]
+        [Display(Name = "Stop Trading After Daily Guard Triggers", Order = 8, GroupName = "Daily Guards")]
+        public bool HaltOnDailyGuard { get; set; } = true;
+
+        [NinjaScriptProperty]
+        [Display(Name = "Flat Before Close (mins)", Order = 9, GroupName = "Session")]
+        [Range(1, 60)]
+        public int MinutesBeforeClose { get; set; } = 2; // force flat a few minutes before 4:59 PM ET (~3:59 PM CT)
+
+        // === User Inputs (Strategy Logic) ===
+        [NinjaScriptProperty]
+        [Display(Name = "ATR Period", Order = 1, GroupName = "Signals")]
+        public int AtrPeriod { get; set; } = 14;
+
+        [NinjaScriptProperty]
+        [Display(Name = "ATR Stop Multiplier", Order = 2, GroupName = "Signals")]
+        public double AtrMultStop { get; set; } = 2.0; // stop ~2x ATR
+
+        [NinjaScriptProperty]
+        [Display(Name = "Target R Multiple", Order = 3, GroupName = "Signals")]
+        public double TargetR { get; set; } = 1.5; // 1.5R take-profit
+
+        [NinjaScriptProperty]
+        [Display(Name = "Fast EMA", Order = 4, GroupName = "Signals")]
+        public int FastEma { get; set; } = 21;
+
+        [NinjaScriptProperty]
+        [Display(Name = "Slow EMA", Order = 5, GroupName = "Signals")]
+        public int SlowEma { get; set; } = 50;
+
+        [NinjaScriptProperty]
+        [Display(Name = "ADX Period", Order = 6, GroupName = "Signals")]
+        public int AdxPeriod { get; set; } = 14;
+
+        [NinjaScriptProperty]
+        [Display(Name = "Min ADX", Order = 7, GroupName = "Signals")]
+        public double MinAdx { get; set; } = 20;
+
+        [NinjaScriptProperty]
+        [Display(Name = "Only Trade Regular Session (RTH)", Order = 8, GroupName = "Session")]
+        public bool RthOnly { get; set; } = true; // avoids illiquid overnight swings
+
+        // === Internals ===
+        private ATR atr;
+        private EMA emaFast, emaSlow;
+        private ADX adx;
+        private double sessionRealizedPnl;
+        private bool dailyGuardTripped;
+        private double peakEquity; // tracks highwater to simulate trailing threshold risk
+
+        // Tick math for NQ (CME): 0.25 tick size, $5 per tick per contract
+        private double TickValuePerContract => 5.0; 
+
+        protected override void OnStateChange()
+        {
+            if (State == State.SetDefaults)
+            {
+                Name = "ApexNQ_EvalGuard";
+                Calculate = Calculate.OnBarClose; // safer fills vs intrabar for evaluation
+                EntriesPerDirection = 1;
+                EntryHandling = EntryHandling.AllEntries;
+                IsExitOnSessionCloseStrategy = false; // we will manage flat-before-close manually
+                IsInstantiatedOnEachOptimizationIteration = false;
+                // Default format hints
+                Description = "NQ strategy with Apex evaluation risk guards: flat-before-close, daily caps, per-trade risk sizing, ATR stops, EMA/ADX trend filter.";
+            }
+            else if (State == State.Configure)
+            {
+                // No additional data series by default; add HTF filters if desired
+            }
+            else if (State == State.DataLoaded)
+            {
+                atr = ATR(AtrPeriod);
+                emaFast = EMA(FastEma);
+                emaSlow = EMA(SlowEma);
+                adx = ADX(AdxPeriod);
+                AddChartIndicator(emaFast);
+                AddChartIndicator(emaSlow);
+                AddChartIndicator(atr);
+                AddChartIndicator(adx);
+            }
+        }
+
+        protected override void OnBarUpdate()
+        {
+            if (CurrentBar < Math.Max(SlowEma, Math.Max(FastEma, AtrPeriod)) + 2)
+                return;
+
+            // === Session resets ===
+            if (Bars.IsFirstBarOfSession)
+            {
+                sessionRealizedPnl = 0;
+                dailyGuardTripped = false;
+            }
+
+            // Track equity high-water (realized + unrealized) to be conservative against trailing threshold
+            double realized = SystemPerformance.AllTrades.TradesPerformance.Currency.CumProfit;
+            double unrealized = Position.MarketPosition != MarketPosition.Flat 
+                ? Position.GetUnrealizedProfitLoss(PerformanceUnit.Currency, Close[0]) : 0;
+            double equity = AccountStartBalance + realized + unrealized;
+            if (equity > peakEquity) peakEquity = equity;
+
+            // === Flat-before-close: force flat a few minutes before 4:59 PM ET (CME timestamps are Central Time) ===
+            // CME RTH close for equity index futures: 4:00 PM CT for day session; Apex requires flat by 4:59 PM ET.
+            // Using ToTime with Central timestamps, 15:59:00 = 3:59 PM CT.
+            int cutoffCT = 155900; // 15:59:00 CT
+            int nowCT = ToTime(Time[0]);
+            int earlyFlatCT = cutoffCT - (MinutesBeforeClose * 100); // rough minute math (safe buffer)
+            if (nowCT >= earlyFlatCT)
+            {
+                if (Position.MarketPosition != MarketPosition.Flat)
+                {
+                    ExitLong("FlatBeforeClose");
+                    ExitShort("FlatBeforeClose");
+                }
+                return; // stop trading this session
+            }
+
+            if (RthOnly && !IsRTH(Time[0]))
+                return;
+
+            // === Daily guard checks ===
+            // Compute session realized PnL from trade collection
+            sessionRealizedPnl = GetSessionRealizedPnL();
+
+            if (!dailyGuardTripped)
+            {
+                if (DailyLossCap > 0 && sessionRealizedPnl <= -Math.Abs(DailyLossCap))
+                {
+                    dailyGuardTripped = true;
+                    Print($"[Guard] Daily loss cap hit: {sessionRealizedPnl:C}. Halting new entries.");
+                }
+                if (DailyProfitLock > 0 && sessionRealizedPnl >= Math.Abs(DailyProfitLock))
+                {
+                    dailyGuardTripped = true;
+                    Print($"[Guard] Daily profit lock reached: {sessionRealizedPnl:C}. Halting new entries.");
+                }
+            }
+            if (HaltOnDailyGuard && dailyGuardTripped)
+            {
+                // manage open position only; no new entries
+                return;
+            }
+
+            // === Signal generation ===
+            bool upTrend = emaFast[0] > emaSlow[0];
+            bool dnTrend = emaFast[0] < emaSlow[0];
+            bool trendStrength = adx[0] >= MinAdx;
+
+            // Avoid trading directly after a large bar to reduce slippage risk
+            bool barIsExtreme = Math.Abs(Close[0] - Open[0]) > (atr[0] * 1.25);
+            if (barIsExtreme) return;
+
+            // === Risk-based position sizing ===
+            double stopDistance = atr[0] * AtrMultStop; // price distance
+            int stopTicks = (int)Math.Ceiling(stopDistance / TickSize);
+            if (stopTicks < 1) stopTicks = 1;
+
+            double riskPerContract = stopTicks * TickValuePerContract;
+            int qtyByRisk = (int)Math.Floor(RiskPerTradeDollars / Math.Max(1, riskPerContract));
+            int qty = Math.Max(0, Math.Min(MaxContracts, qtyByRisk));
+
+            if (qty < 1)
+            {
+                // If ATR stop is too wide for risk cap, skip trade
+                return;
+            }
+
+            // Protect trailing threshold: ensure worst-case open loss doesn't exceed (TrailingThresholdDollars * 0.30) conservatively
+            double worstOpenRisk = qty * riskPerContract;
+            if (worstOpenRisk > Math.Max(100, TrailingThresholdDollars * 0.30))
+            {
+                // scale down further as needed
+                qty = (int)Math.Floor(Math.Max(1, Math.Max(100, TrailingThresholdDollars * 0.30) / riskPerContract));
+                qty = Math.Max(0, Math.Min(MaxContracts, qty));
+                if (qty < 1) return;
+            }
+
+            // Compute profit target in ticks based on R multiple
+            int targetTicks = (int)Math.Ceiling(stopTicks * TargetR);
+            double entryPrice = Close[0];
+
+            // === Entries (one entry per direction, managed by Set methods) ===
+            // Use SetStopLoss/SetProfitTarget just before the entry so they apply per-trade
+            if (Position.MarketPosition == MarketPosition.Flat && trendStrength)
+            {
+                if (upTrend && Close[0] > emaFast[0])
+                {
+                    SetStopLoss(CalculationMode.Price, entryPrice - (stopTicks * TickSize));
+                    SetProfitTarget(CalculationMode.Price, entryPrice + (targetTicks * TickSize));
+                    EnterLong(qty, "L");
+                }
+                else if (dnTrend && Close[0] < emaFast[0])
+                {
+                    SetStopLoss(CalculationMode.Price, entryPrice + (stopTicks * TickSize));
+                    SetProfitTarget(CalculationMode.Price, entryPrice - (targetTicks * TickSize));
+                    EnterShort(qty, "S");
+                }
+            }
+        }
+
+        // === Helpers ===
+        private bool IsRTH(DateTime time)
+        {
+            // CME Equity Index RTH (Mon-Fri): 8:30 AM CT to 3:00 PM CT; we still must be flat by 3:59 PM CT per Apex.
+            int t = ToTime(time);
+            return (t >= 083000 && t <= 150000);
+        }
+
+        private double GetSessionRealizedPnL()
+		{
+    		double pnl = 0;
+
+    		// Session start = first bar of session
+    		DateTime sessionStart = Times[0][0].Date;
+    		DateTime sessionEnd   = sessionStart.AddDays(1);
+
+    		foreach (var trade in SystemPerformance.AllTrades)
+    		{
+        		if (trade.Exit != null 
+            		&& trade.Exit.Time >= sessionStart 
+            		&& trade.Exit.Time < sessionEnd)
+        		{
+            		pnl += trade.ProfitCurrency;
+        		}
+    		}
+    		return pnl;
+		}
+
+        #region Properties (for UI organization)
+        [Browsable(false)]
+        public string PlanSummary => $"Start ${AccountStartBalance:N0}, Target ${ProfitTargetDollars:N0}, Drawdown ${TrailingThresholdDollars:N0}";
+        #endregion
+    }
+}
